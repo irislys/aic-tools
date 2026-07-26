@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build static release
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Verify static CRT (no vcruntime/ucrt)
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/aic-tools.exe"
+          $b = [IO.File]::ReadAllBytes((Resolve-Path $exe))
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $magic = [BitConverter]::ToUInt16($b, $pe + 0x18)
+          $impRva = if ($magic -eq 0x20B) {
+            [BitConverter]::ToUInt32($b, $pe + 0x90)
+          } else {
+            [BitConverter]::ToUInt32($b, $pe + 0x80)
+          }
+          $nsec = [BitConverter]::ToUInt16($b, $pe + 6)
+          $opt = [BitConverter]::ToUInt16($b, $pe + 0x14)
+          $sec = $pe + 0x18 + $opt
+          function RvaOff([uint32]$rva) {
+            for ($i = 0; $i -lt $nsec; $i++) {
+              $o = $sec + $i * 40
+              $va = [BitConverter]::ToUInt32($b, $o + 12)
+              $vs = [BitConverter]::ToUInt32($b, $o + 8)
+              $rs = [BitConverter]::ToUInt32($b, $o + 16)
+              $rp = [BitConverter]::ToUInt32($b, $o + 20)
+              if ($rva -ge $va -and $rva -lt ($va + [Math]::Max($vs, $rs))) {
+                return [int]($rva - $va + $rp)
+              }
+            }
+            throw "rva $rva not mapped"
+          }
+          $off = RvaOff $impRva
+          $dlls = [System.Collections.Generic.List[string]]::new()
+          while ($true) {
+            $nameRva = [BitConverter]::ToUInt32($b, $off + 12)
+            if ($nameRva -eq 0) { break }
+            $no = RvaOff $nameRva
+            $n = ""
+            while ($b[$no] -ne 0) { $n += [char]$b[$no]; $no++ }
+            $dlls.Add($n.ToLowerInvariant())
+            $off += 20
+          }
+          Write-Host "Imports:"
+          $dlls | ForEach-Object { Write-Host "  $_" }
+          $bad = $dlls | Where-Object {
+            $_ -match '^(vcruntime|msvcp|msvcr|ucrtbase|api-ms-win-crt|libgcc|libwinpthread|libstdc)'
+          }
+          if ($bad) {
+            throw "non-static CRT imports: $($bad -join ', ')"
+          }
+          Write-Host "OK: CRT is static; only system DLLs imported"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: target/x86_64-pc-windows-msvc/release/aic-tools.exe
