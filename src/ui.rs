@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use crate::find::{self, CaneTargets, JuiceTarget};
+use crate::force_debug_menu::{self, F7Patch};
 use crate::formula::{self, AXES};
 use crate::game_version;
 use crate::log;
@@ -17,6 +18,7 @@ pub struct Session {
     pub juice: Option<JuiceTarget>,
     pub map_bak: MapBackup,
     pub mosaic_bak: MosaicPatch,
+    pub f7_bak: F7Patch,
 }
 
 impl Session {
@@ -39,6 +41,7 @@ impl Session {
             log::error(&msg);
             return Err(msg);
         }
+        log::info(format!("目标兼容性校验通过 pid={}", proc.pid()));
         Ok(Self {
             proc,
             version,
@@ -46,6 +49,7 @@ impl Session {
             juice: None,
             map_bak: MapBackup::empty(),
             mosaic_bak: MosaicPatch::empty(),
+            f7_bak: F7Patch::empty(),
         })
     }
 
@@ -76,29 +80,96 @@ fn read_line(prompt: &str) -> String {
     s.trim().to_string()
 }
 
+fn clear_screen() {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, COORD, FillConsoleOutputAttribute, FillConsoleOutputCharacterW,
+        GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleCursorPosition,
+    };
+
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == (-1isize as _) {
+            println!();
+            let _ = io::stdout().flush();
+            return;
+        }
+        let mut info = std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFO>();
+        if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
+            println!();
+            let _ = io::stdout().flush();
+            return;
+        }
+        let size = (info.dwSize.X as u32).saturating_mul(info.dwSize.Y as u32);
+        let home = COORD { X: 0, Y: 0 };
+        let mut written = 0u32;
+        FillConsoleOutputCharacterW(h, b' ' as u16, size, home, &mut written);
+        FillConsoleOutputAttribute(h, info.wAttributes, size, home, &mut written);
+        SetConsoleCursorPosition(h, home);
+    }
+    let _ = io::stdout().flush();
+}
+
+fn print_menu(session: &Session) {
+    let mos = mosaic::status(&session.proc, &session.mosaic_bak);
+    let f7 = force_debug_menu::status(&session.proc, &session.f7_bak);
+    println!("0.29j  pid={}", session.proc.pid());
+    println!("1 法杖数值");
+    println!("2 诺艾尔汁映射");
+    println!("3 恢复映射");
+    println!("4 重新定位");
+    println!("5 禁用马赛克  [马赛克:{mos}]");
+    println!("6 恢复马赛克");
+    println!("7 启用F7调试  [F7:{f7}]");
+    println!("0 退出");
+    println!("提示: F7 须在标题界面启用；成功后游戏内按 F7；重启失效");
+}
+
+fn pause_enter(msg: &str) {
+    let _ = read_line(msg);
+}
+
 pub fn run_menu(session: &mut Session) {
     loop {
         if let Err(e) = session.ensure_alive() {
             eprintln!("{e}");
             log::warn(&e);
+            pause_enter("按回车键退出...");
             break;
         }
-        let mos = mosaic::status(&session.proc, &session.mosaic_bak);
-        println!(
-            "\n0.29j pid={}\n1 法杖数值  2 诺艾尔汁映射  3 恢复映射  4 重新定位\n5 禁用马赛克  6 恢复马赛克  [{mos}]\n0 退出",
-            session.proc.pid()
-        );
+        clear_screen();
+        print_menu(session);
         match read_line("> ").as_str() {
-            "1" => menu_cane_stats(session),
-            "2" => menu_map_juice(session),
-            "3" => menu_restore_map(session),
+            "1" => {
+                menu_cane_stats(session);
+                pause_enter("按回车返回菜单...");
+            }
+            "2" => {
+                menu_map_juice(session);
+                pause_enter("按回车返回菜单...");
+            }
+            "3" => {
+                menu_restore_map(session);
+                pause_enter("按回车返回菜单...");
+            }
             "4" => {
                 session.cane = None;
                 session.juice = None;
                 log::info("清空定位缓存");
+                println!("已清空定位缓存");
+                pause_enter("按回车返回菜单...");
             }
-            "5" => menu_disable_mosaic(session),
-            "6" => menu_restore_mosaic(session),
+            "5" => {
+                menu_disable_mosaic(session);
+                pause_enter("按回车返回菜单...");
+            }
+            "6" => {
+                menu_restore_mosaic(session);
+                pause_enter("按回车返回菜单...");
+            }
+            "7" => {
+                menu_enable_f7(session);
+                pause_enter("按回车返回菜单...");
+            }
             "0" | "q" | "Q" => break,
             _ => {}
         }
@@ -117,7 +188,7 @@ fn ensure_cane(session: &mut Session) -> Result<(), String> {
 
 fn ensure_juice(session: &mut Session) -> Result<(), String> {
     if let Some(j) = &session.juice {
-        session.verify_cached(j.nel_item, "果汁NelItem")?;
+        session.verify_cached(j.nel_item, "诺艾尔汁NelItem")?;
         return Ok(());
     }
     let t = find::find_noel_juice(&session.proc)?;
@@ -351,6 +422,25 @@ fn menu_restore_mosaic(session: &mut Session) {
         Err(e) => {
             log::error(format!("恢复马赛克失败: {e}"));
             eprintln!("{e}");
+        }
+    }
+}
+
+fn menu_enable_f7(session: &mut Session) {
+    if let Err(e) = session.ensure_alive() {
+        eprintln!("{e}");
+        return;
+    }
+    println!("扫描 initDebugger IL...");
+    match force_debug_menu::apply(&session.proc, &session.f7_bak) {
+        Ok(bak) => {
+            session.f7_bak = bak;
+            println!("F7 调试菜单已解锁");
+        }
+        Err(e) => {
+            log::error(format!("启用 F7 失败: {e}"));
+            eprintln!("{e}");
+            eprintln!("提示: 回到标题界面后重试；确认版本为 0.29j");
         }
     }
 }

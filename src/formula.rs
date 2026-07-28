@@ -95,6 +95,15 @@ pub const AXES: &[AxisDef] = &[
 ];
 
 const UI_DISPLAY_MAX: f32 = 255.0;
+const MAX_TEMPLATE_ARRAY_LEN: u32 = 64;
+
+fn is_valid_template_array_len(n: u32) -> bool {
+    (2..=MAX_TEMPLATE_ARRAY_LEN).contains(&n)
+}
+
+fn is_valid_array_len(n: u32) -> bool {
+    (1..=MAX_TEMPLATE_ARRAY_LEN).contains(&n)
+}
 
 pub fn forward_display(axis_id: u8, f: &PrCaneFields) -> f32 {
     let raw = match axis_id {
@@ -304,11 +313,22 @@ pub fn write_cane_table_axis(
                         if !proc.read_bytes(t, &mut header) {
                             continue;
                         }
-                        let n = u32::from_le_bytes(header[0x18..0x1C].try_into().unwrap()).max(2);
+                        let n = u32::from_le_bytes(header[0x18..0x1C].try_into().unwrap());
+                        if !is_valid_template_array_len(n) {
+                            return Err(format!(
+                                "模板数组长度异常: {n}（允许 2..={MAX_TEMPLATE_ARRAY_LEN}）"
+                            ));
+                        }
                         header[0x10..0x14].copy_from_slice(&n.to_le_bytes());
                         header[0x14..0x18].copy_from_slice(&n.to_le_bytes());
                         header[0x18..0x1C].copy_from_slice(&n.to_le_bytes());
-                        let size = 0x20 + (n as usize) * 4;
+                        let size = 0x20usize
+                            .checked_add(
+                                (n as usize)
+                                    .checked_mul(std::mem::size_of::<f32>())
+                                    .ok_or("模板数组大小溢出")?,
+                            )
+                            .ok_or("模板数组大小溢出")?;
                         let new_arr = match proc.alloc_remote(size) {
                             Some(a) => a,
                             None => continue,
@@ -327,7 +347,14 @@ pub fn write_cane_table_axis(
                 }
             }
         };
-        let n = proc.read_u32(arr + ARR_LEN).unwrap_or(1);
+        let n = proc
+            .read_u32(arr + ARR_LEN)
+            .ok_or_else(|| format!("读取数组长度失败 cane+{off:#x}"))?;
+        if !is_valid_array_len(n) {
+            return Err(format!(
+                "数组长度异常: {n}（允许 1..={MAX_TEMPLATE_ARRAY_LEN}）"
+            ));
+        }
         if !proc.write_f32(arr + ARR_DATA, lo) {
             return Err(format!("write array[0] cane+{off:#x}"));
         }
@@ -393,5 +420,19 @@ mod tests {
                 axis.name_zh
             );
         }
+    }
+
+    #[test]
+    fn array_lengths_are_bounded() {
+        assert!(!is_valid_template_array_len(0));
+        assert!(!is_valid_template_array_len(1));
+        assert!(is_valid_template_array_len(2));
+        assert!(is_valid_template_array_len(MAX_TEMPLATE_ARRAY_LEN));
+        assert!(!is_valid_template_array_len(MAX_TEMPLATE_ARRAY_LEN + 1));
+
+        assert!(!is_valid_array_len(0));
+        assert!(is_valid_array_len(1));
+        assert!(is_valid_array_len(MAX_TEMPLATE_ARRAY_LEN));
+        assert!(!is_valid_array_len(MAX_TEMPLATE_ARRAY_LEN + 1));
     }
 }

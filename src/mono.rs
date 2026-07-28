@@ -50,10 +50,21 @@ pub fn compile_method(proc: &Process, method: u64) -> Result<u64, String> {
     if method == 0 {
         return Err("null method".into());
     }
+    if proc.is_alive() == Some(false) {
+        return Err("游戏进程已退出".into());
+    }
     let api = MonoApi::resolve(proc)?;
-    let domain = api.root_domain(proc)?;
-    let _ = api.thread_attach(proc, domain);
-    let addr = api.compile_method(proc, method)?;
+    let addr = proc.remote_mono_compile(
+        api.get_root_domain,
+        api.thread_attach,
+        api.domain_set,
+        api.compile_method,
+        method,
+        60_000,
+    )?;
+    if proc.is_alive() == Some(false) {
+        return Err("mono_compile_method 导致游戏进程退出".into());
+    }
     if addr == 0 {
         return Err("mono_compile_method returned null".into());
     }
@@ -63,6 +74,7 @@ pub fn compile_method(proc: &Process, method: u64) -> Result<u64, String> {
 struct MonoApi {
     get_root_domain: u64,
     thread_attach: u64,
+    domain_set: u64,
     image_loaded: u64,
     class_from_name: u64,
     class_get_field_from_name: u64,
@@ -89,9 +101,11 @@ impl MonoApi {
             "mono_compile_method",
         ];
         let f = resolve_exports(proc, module.base, NAMES)?;
+        let domain_set = resolve_export_one(proc, module.base, "mono_domain_set").unwrap_or(0);
         Ok(Self {
             get_root_domain: f[0],
             thread_attach: f[1],
+            domain_set,
             image_loaded: f[2],
             class_from_name: f[3],
             class_get_field_from_name: f[4],
@@ -194,11 +208,10 @@ impl MonoApi {
         }
         Ok(m)
     }
+}
 
-    fn compile_method(&self, proc: &Process, method: u64) -> Result<u64, String> {
-        Self::call(proc, self.compile_method, &[method])
-            .map_err(|e| format!("mono_compile_method: {e}"))
-    }
+fn resolve_export_one(proc: &Process, mono_base: u64, name: &str) -> Option<u64> {
+    resolve_exports(proc, mono_base, &[name]).ok().map(|v| v[0])
 }
 
 fn resolve_exports(proc: &Process, mono_base: u64, names: &[&str]) -> Result<Vec<u64>, String> {

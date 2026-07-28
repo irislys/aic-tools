@@ -1,5 +1,6 @@
 mod aob;
 mod find;
+mod force_debug_menu;
 mod formula;
 mod game_version;
 mod log;
@@ -9,6 +10,14 @@ mod mono;
 mod mosaic;
 mod offsets;
 mod ui;
+
+fn wait_enter() {
+    use std::io::{self, Write};
+    eprint!("按回车键退出...");
+    let _ = io::stderr().flush();
+    let mut s = String::new();
+    let _ = io::stdin().read_line(&mut s);
+}
 
 fn main() {
     crate::log::init();
@@ -21,7 +30,9 @@ fn main() {
         }
         Err(e) => {
             crate::log::error(format!("附加失败: {e}"));
-            eprintln!("{e}");
+            eprintln!("附加失败: {e}");
+            eprintln!("请先启动 AliceInCradle.exe（0.29j），并以管理员身份运行本工具。");
+            wait_enter();
             std::process::exit(1);
         }
     };

@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::mem::Process;
 
 pub const SUPPORTED_CONTENT_VERSIONS: &[&str] = &["0.29j"];
+const MAX_GLOBAL_GAME_MANAGERS_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn is_supported(version: &str) -> bool {
     let v = version.trim();
@@ -13,10 +14,18 @@ pub fn detect_content_version(proc: &Process) -> Result<String, String> {
     let exe = proc
         .exe_path()
         .ok_or_else(|| "无法取得进程路径".to_string())?;
+    let exe = std::fs::canonicalize(exe).map_err(|e| format!("无法规范化进程路径: {e}"))?;
+    if !exe
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("AliceInCradle.exe"))
+    {
+        return Err(format!("目标可执行文件名异常: {}", exe.display()));
+    }
     let data_dir = exe
         .parent()
         .map(|p| p.join("AliceInCradle_Data"))
         .ok_or_else(|| "进程路径无效".to_string())?;
+    let data_dir = std::fs::canonicalize(data_dir).map_err(|e| format!("游戏数据目录无效: {e}"))?;
     let ggm = data_dir.join("globalgamemanagers");
     if !ggm.is_file() {
         return Err(format!("未找到 {}", ggm.display()));
@@ -25,6 +34,14 @@ pub fn detect_content_version(proc: &Process) -> Result<String, String> {
 }
 
 fn parse_version_from_globalgamemanagers(path: &Path) -> Result<String, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("读取 globalgamemanagers 元数据失败: {e}"))?
+        .len();
+    if size > MAX_GLOBAL_GAME_MANAGERS_BYTES {
+        return Err(format!(
+            "globalgamemanagers 过大 ({size} bytes, 上限 {MAX_GLOBAL_GAME_MANAGERS_BYTES})"
+        ));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("读取 globalgamemanagers 失败: {e}"))?;
     let mut cands = extract_unity_len_strings(&bytes);
     cands.retain(|(_, v)| is_plausible_content_version(v));

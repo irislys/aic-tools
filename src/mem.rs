@@ -1,8 +1,11 @@
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of, zeroed};
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FlushInstructionCache, ReadProcessMemory, WriteProcessMemory,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
     Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
@@ -15,7 +18,7 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-    QueryFullProcessImageNameW, TerminateThread, WaitForSingleObject,
+    QueryFullProcessImageNameW, WaitForSingleObject,
 };
 
 #[link(name = "kernel32")]
@@ -48,6 +51,16 @@ const REMOTE_CALL_STUB: &[u8] = &[
     0x20, 0x48, 0x89, 0x43, 0x28, 0x31, 0xC0, 0x5B, 0xC3,
 ];
 
+const REMOTE_MONO_COMPILE_STUB: &[u8] = &[
+    0x53, 0x48, 0x89, 0xCB, 0x48, 0x8B, 0x03, 0x48, 0x83, 0xEC, 0x20, 0xFF, 0xD0, 0x48, 0x83, 0xC4,
+    0x20, 0x48, 0x85, 0xC0, 0x74, 0x48, 0x48, 0x89, 0x43, 0x38, 0x48, 0x89, 0xC1, 0x48, 0x8B, 0x43,
+    0x08, 0x48, 0x83, 0xEC, 0x20, 0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x20, 0x48, 0x8B, 0x43, 0x10, 0x48,
+    0x85, 0xC0, 0x74, 0x10, 0x48, 0x8B, 0x4B, 0x38, 0x31, 0xD2, 0x48, 0x83, 0xEC, 0x20, 0xFF, 0xD0,
+    0x48, 0x83, 0xC4, 0x20, 0x48, 0x8B, 0x4B, 0x20, 0x48, 0x8B, 0x43, 0x18, 0x48, 0x83, 0xEC, 0x20,
+    0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x20, 0x48, 0x89, 0x43, 0x28, 0x31, 0xC0, 0x5B, 0xC3, 0x31, 0xC0,
+    0x48, 0x89, 0x43, 0x28, 0x5B, 0xC3,
+];
+
 #[repr(C)]
 struct RemoteCallLayout {
     func: u64,
@@ -58,9 +71,22 @@ struct RemoteCallLayout {
     result: u64,
 }
 
+#[repr(C)]
+struct MonoCompileLayout {
+    get_root_domain: u64,
+    thread_attach: u64,
+    domain_set: u64,
+    compile_method: u64,
+    method: u64,
+    result: u64,
+    _pad: u64,
+    domain_tmp: u64,
+}
+
 #[derive(Debug)]
 pub enum OpenError {
     NotFound { name: String },
+    Multiple { name: String, count: usize },
     AccessDenied { pid: u32 },
 }
 
@@ -68,6 +94,12 @@ impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound { name } => write!(f, "process not found: {name}"),
+            Self::Multiple { name, count } => {
+                write!(
+                    f,
+                    "found {count} processes named {name}; close the extras and retry"
+                )
+            }
             Self::AccessDenied { pid } => {
                 write!(f, "OpenProcess({pid}) failed — run as Administrator?")
             }
@@ -83,21 +115,51 @@ pub struct ModuleInfo {
 pub struct Process {
     pub(crate) handle: HANDLE,
     pid: u32,
+    pending_remote_calls: Mutex<Vec<PendingRemoteCall>>,
 }
 
 unsafe impl Send for Process {}
 
+struct PendingRemoteCall {
+    thread: HANDLE,
+    code: u64,
+    data: u64,
+}
+
 impl Drop for Process {
     fn drop(&mut self) {
+        if let Ok(pending) = self.pending_remote_calls.get_mut() {
+            for call in pending.drain(..) {
+                if unsafe { WaitForSingleObject(call.thread, 0) } == WAIT_OBJECT_0 {
+                    unsafe {
+                        VirtualFreeEx(self.handle, call.data as *mut c_void, 0, MEM_RELEASE);
+                        VirtualFreeEx(self.handle, call.code as *mut c_void, 0, MEM_RELEASE);
+                    }
+                }
+                close_handle(call.thread);
+            }
+        }
         close_handle(self.handle);
     }
 }
 
 impl Process {
     pub fn open_by_name(name: &str) -> Result<Self, OpenError> {
-        let pid = find_pid(name).ok_or_else(|| OpenError::NotFound {
-            name: name.to_string(),
-        })?;
+        let pids = find_pids(name);
+        let pid = match pids.as_slice() {
+            [] => {
+                return Err(OpenError::NotFound {
+                    name: name.to_string(),
+                });
+            }
+            [pid] => *pid,
+            _ => {
+                return Err(OpenError::Multiple {
+                    name: name.to_string(),
+                    count: pids.len(),
+                });
+            }
+        };
         Self::open_pid(pid)
     }
 
@@ -106,7 +168,11 @@ impl Process {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Err(OpenError::AccessDenied { pid });
         }
-        Ok(Self { handle, pid })
+        Ok(Self {
+            handle,
+            pid,
+            pending_remote_calls: Mutex::new(Vec::new()),
+        })
     }
 
     pub fn pid(&self) -> u32 {
@@ -248,6 +314,9 @@ impl Process {
     }
 
     pub fn alloc_remote_protect(&self, size: usize, protect: u32) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
         let p = unsafe {
             VirtualAllocEx(
                 self.handle,
@@ -312,18 +381,6 @@ impl Process {
             return Err("at most 4 args".into());
         }
 
-        let stub_size = (REMOTE_CALL_STUB.len() + 15) & !15;
-        let layout_size = size_of::<RemoteCallLayout>();
-        let remote = self
-            .alloc_remote_protect(stub_size + layout_size, PAGE_EXECUTE_READWRITE)
-            .ok_or("VirtualAllocEx failed")?;
-
-        let cleanup = || self.free_remote(remote);
-        if !self.write_bytes(remote, REMOTE_CALL_STUB) {
-            cleanup();
-            return Err("write stub failed".into());
-        }
-
         let mut a = [0u64; 4];
         a[..args.len()].copy_from_slice(args);
         let layout = RemoteCallLayout {
@@ -334,15 +391,94 @@ impl Process {
             arg3: a[3],
             result: 0,
         };
-        let la = remote + stub_size as u64;
-        let lb = unsafe {
+        let layout_bytes = unsafe {
             std::slice::from_raw_parts(
                 (&layout as *const RemoteCallLayout).cast::<u8>(),
-                layout_size,
+                size_of::<RemoteCallLayout>(),
             )
         };
-        if !self.write_bytes(la, lb) {
-            cleanup();
+        let out = self.run_remote_stub(
+            REMOTE_CALL_STUB,
+            layout_bytes,
+            offset_of!(RemoteCallLayout, result),
+            timeout_ms,
+        )?;
+        Ok(out)
+    }
+
+    pub fn remote_mono_compile(
+        &self,
+        get_root_domain: u64,
+        thread_attach: u64,
+        domain_set: u64,
+        compile_method: u64,
+        method: u64,
+        timeout_ms: u32,
+    ) -> Result<u64, String> {
+        if get_root_domain == 0 || thread_attach == 0 || compile_method == 0 || method == 0 {
+            return Err("null mono compile arg".into());
+        }
+        let layout = MonoCompileLayout {
+            get_root_domain,
+            thread_attach,
+            domain_set,
+            compile_method,
+            method,
+            result: 0,
+            _pad: 0,
+            domain_tmp: 0,
+        };
+        let layout_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&layout as *const MonoCompileLayout).cast::<u8>(),
+                size_of::<MonoCompileLayout>(),
+            )
+        };
+        self.run_remote_stub(
+            REMOTE_MONO_COMPILE_STUB,
+            layout_bytes,
+            offset_of!(MonoCompileLayout, result),
+            timeout_ms,
+        )
+    }
+
+    fn run_remote_stub(
+        &self,
+        stub: &[u8],
+        layout_bytes: &[u8],
+        result_off: usize,
+        timeout_ms: u32,
+    ) -> Result<u64, String> {
+        self.reap_pending_remote_calls()?;
+
+        let code = self
+            .alloc_remote(stub.len())
+            .ok_or("VirtualAllocEx code allocation failed")?;
+        let data = match self.alloc_remote(layout_bytes.len()) {
+            Some(data) => data,
+            None => {
+                self.free_remote(code);
+                return Err("VirtualAllocEx data allocation failed".into());
+            }
+        };
+        if !self.write_bytes(code, stub) {
+            self.free_remote(data);
+            self.free_remote(code);
+            return Err("write stub failed".into());
+        }
+        if !self.protect_remote(code, stub.len(), PAGE_EXECUTE_READ) {
+            self.free_remote(data);
+            self.free_remote(code);
+            return Err("protect stub failed".into());
+        }
+        if unsafe { FlushInstructionCache(self.handle, code as *const c_void, stub.len()) } == 0 {
+            self.free_remote(data);
+            self.free_remote(code);
+            return Err("FlushInstructionCache failed".into());
+        }
+        if !self.write_bytes(data, layout_bytes) {
+            self.free_remote(data);
+            self.free_remote(code);
             return Err("write layout failed".into());
         }
 
@@ -351,43 +487,76 @@ impl Process {
                 self.handle,
                 std::ptr::null(),
                 0,
-                std::mem::transmute::<u64, unsafe extern "system" fn(*mut c_void) -> u32>(remote),
-                la as *mut c_void,
+                std::mem::transmute::<u64, unsafe extern "system" fn(*mut c_void) -> u32>(code),
+                data as *mut c_void,
                 0,
                 std::ptr::null_mut(),
             )
         };
         if thread.is_null() {
-            cleanup();
+            self.free_remote(data);
+            self.free_remote(code);
             return Err("CreateRemoteThread failed".into());
         }
 
         let w = unsafe { WaitForSingleObject(thread, timeout_ms) };
         if w == WAIT_TIMEOUT {
-            unsafe {
-                TerminateThread(thread, 1);
-                WaitForSingleObject(thread, 1000);
-            }
-            close_handle(thread);
-            cleanup();
-            return Err("timed out".into());
+            self.retain_pending_remote_call(thread, code, data);
+            return Err("timed out; the remote call is still running".into());
         }
-        close_handle(thread);
         if w != WAIT_OBJECT_0 {
-            cleanup();
+            self.retain_pending_remote_call(thread, code, data);
             return Err(format!("WaitForSingleObject failed code={w}"));
         }
+        close_handle(thread);
 
-        let result_off = offset_of!(RemoteCallLayout, result) as u64;
-        let result = match self.read_u64(la + result_off) {
+        let result = match self.read_u64(data + result_off as u64) {
             Some(v) => v,
             None => {
-                cleanup();
+                self.free_remote(data);
+                self.free_remote(code);
                 return Err("read result failed".into());
             }
         };
-        cleanup();
+        self.free_remote(data);
+        self.free_remote(code);
         Ok(result)
+    }
+
+    fn protect_remote(&self, addr: u64, size: usize, protect: u32) -> bool {
+        let mut old = 0u32;
+        unsafe { VirtualProtectEx(self.handle, addr as *mut c_void, size, protect, &mut old) != 0 }
+    }
+
+    fn reap_pending_remote_calls(&self) -> Result<(), String> {
+        let mut pending = self
+            .pending_remote_calls
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mut i = 0;
+        while i < pending.len() {
+            if unsafe { WaitForSingleObject(pending[i].thread, 0) } == WAIT_OBJECT_0 {
+                let call = pending.swap_remove(i);
+                close_handle(call.thread);
+                self.free_remote(call.data);
+                self.free_remote(call.code);
+            } else {
+                i += 1;
+            }
+        }
+        if pending.is_empty() {
+            Ok(())
+        } else {
+            Err("a previous remote call is still running; retry after it finishes".into())
+        }
+    }
+
+    fn retain_pending_remote_call(&self, thread: HANDLE, code: u64, data: u64) {
+        let mut pending = self
+            .pending_remote_calls
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        pending.push(PendingRemoteCall { thread, code, data });
     }
 
     pub fn is_alive(&self) -> Option<bool> {
@@ -486,25 +655,28 @@ fn close_handle(h: HANDLE) {
     }
 }
 
-fn find_pid(name: &str) -> Option<u32> {
+fn find_pids(name: &str) -> Vec<u32> {
     let name_l = name.to_ascii_lowercase();
-    let snap = Snapshot::processes()?;
+    let Some(snap) = Snapshot::processes() else {
+        return Vec::new();
+    };
     let mut pe = unsafe { zeroed::<PROCESSENTRY32W>() };
     pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut pids = Vec::new();
     unsafe {
         if Process32FirstW(snap.0, &mut pe) == 0 {
-            return None;
+            return pids;
         }
         loop {
             if widestr(&pe.szExeFile).eq_ignore_ascii_case(&name_l) {
-                return Some(pe.th32ProcessID);
+                pids.push(pe.th32ProcessID);
             }
             if Process32NextW(snap.0, &mut pe) == 0 {
                 break;
             }
         }
     }
-    None
+    pids
 }
 
 fn widestr(buf: &[u16]) -> String {

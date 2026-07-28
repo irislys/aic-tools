@@ -75,3 +75,10 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: target/x86_64-pc-windows-msvc/release/aic-tools.exe
+          body: |
+            ## 更新说明
+
+            - 新增游戏内 F7 调试菜单启用功能。
+            - 菜单操作完成后会保留结果提示，查看更方便。
+            - 启动时会自动识别受支持的游戏版本；版本不匹配时不会继续操作。
+            - 提升扫描、修改和补丁操作的稳定性。

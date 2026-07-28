@@ -22,6 +22,9 @@ impl MosaicPatch {
 }
 
 pub fn apply(proc: &Process, prev: &MosaicPatch) -> Result<MosaicPatch, String> {
+    if proc.is_alive() == Some(false) {
+        return Err("游戏进程已退出".into());
+    }
     let method = mono::find_method(
         proc,
         "Assembly-CSharp",
@@ -30,9 +33,13 @@ pub fn apply(proc: &Process, prev: &MosaicPatch) -> Result<MosaicPatch, String> 
         "FnDrawMosaic",
         3,
     )?;
+    log::info(format!("FnDrawMosaic method={method:#x}，开始同线程 JIT"));
     let addr = mono::compile_method(proc, method)?;
     if addr == 0 || !(0x10000..=0x0000_7FFF_FFFF_FFFF).contains(&addr) {
         return Err(format!("FnDrawMosaic 原生地址无效: {addr:#x}"));
+    }
+    if proc.is_alive() == Some(false) {
+        return Err("写入补丁前游戏已退出".into());
     }
 
     let mut head = [0u8; 3];
@@ -86,7 +93,7 @@ pub fn restore(proc: &Process, bak: &MosaicPatch) -> Result<(), String> {
 
 pub fn status(proc: &Process, bak: &MosaicPatch) -> String {
     if !bak.applied || bak.addr == 0 {
-        return "未应用".into();
+        return "关".into();
     }
     let mut cur = [0u8; 3];
     if !proc.read_bytes(bak.addr, &mut cur) {
